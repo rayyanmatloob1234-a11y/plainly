@@ -1,6 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Bolt, Check, Lock, GitCompare } from "lucide-react";
 
 import { Navbar } from "@/components/plainly/Navbar";
@@ -10,9 +10,12 @@ import { ResultCard } from "@/components/plainly/ResultCard";
 import { ExportBar } from "@/components/plainly/ExportBar";
 import { ExampleResult } from "@/components/plainly/ExampleResult";
 import { CompareDocuments } from "@/components/plainly/CompareDocuments";
+import { CreditGate } from "@/components/plainly/CreditGate";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { analyseDocument, type AnalyseResult } from "@/lib/analyse.functions";
 import { extractPdfText } from "@/lib/pdf-text";
+import { canUserAnalyse, recordAnalysis, saveDocument } from "@/lib/supabase";
+import { useAuth } from "@/hooks/useAuth";
 import { toast } from "sonner";
 
 export const Route = createFileRoute("/")({
@@ -50,6 +53,7 @@ type State =
   | { step: "idle"; error?: string }
   | { step: "loading" }
   | { step: "compare" }
+  | { step: "gate" }
   | { step: "result"; result: AnalyseResult; fileName: string; sourceText?: string; sourceFile?: { base64: string; mime: string; name: string } };
 
 function getErrorMessage(error: unknown) {
@@ -58,17 +62,47 @@ function getErrorMessage(error: unknown) {
   return "Something went wrong while analysing the document.";
 }
 
+// Anonymous usage tracked in localStorage
+const ANON_KEY = "plainly_anon_used";
+function getAnonUsed(): number {
+  try { return parseInt(localStorage.getItem(ANON_KEY) || "0"); } catch { return 0; }
+}
+function incrementAnonUsed() {
+  try { localStorage.setItem(ANON_KEY, String(getAnonUsed() + 1)); } catch {}
+}
+
 function Index() {
   const [state, setState] = useState<State>({ step: "idle" });
   const [language, setLanguage] = useState("English");
+  const [anonUsed, setAnonUsed] = useState(0);
+  const { user, profile, loading: authLoading } = useAuth();
   const analyse = useServerFn(analyseDocument);
 
+  useEffect(() => {
+    setAnonUsed(getAnonUsed());
+  }, []);
+
   async function handleSubmit(payload: UploadPayload) {
+    // Check if user can analyse
+    const userId = user?.id ?? null;
+    const check = await canUserAnalyse(userId);
+
+    if (!check.allowed) {
+      setState({ step: "gate" });
+      return;
+    }
+
     setState({ step: "loading" });
     try {
+      let result: AnalyseResult;
+      let fileName: string;
+      let sourceText: string | undefined;
+      let sourceFile: { base64: string; mime: string; name: string } | undefined;
+
       if (payload.kind === "text") {
-        const result = await analyse({ data: { text: payload.text, language } });
-        setState({ step: "result", result, fileName: "Pasted text", sourceText: payload.text });
+        result = await analyse({ data: { text: payload.text, language } });
+        fileName = "Pasted text";
+        sourceText = payload.text;
       } else {
         const mime = payload.file.type || "application/octet-stream";
         let extractedText = "";
@@ -76,19 +110,45 @@ function Index() {
           try { extractedText = await extractPdfText(payload.file); } catch { extractedText = ""; }
         }
         const base64 = extractedText ? null : await fileToBase64(payload.file);
-        const result = await analyse({
+        result = await analyse({
           data: extractedText
             ? { text: extractedText, fileName: payload.file.name, language }
             : { fileBase64: base64!, fileMime: mime, fileName: payload.file.name, language },
         });
-        setState({
-          step: "result",
-          result,
-          fileName: payload.file.name,
-          sourceText: extractedText || undefined,
-          sourceFile: extractedText ? undefined : { base64: base64!, mime, name: payload.file.name },
-        });
+        fileName = payload.file.name;
+        sourceText = extractedText || undefined;
+        sourceFile = extractedText ? undefined : { base64: base64!, mime, name: payload.file.name };
       }
+
+      // Record the analysis usage
+      await recordAnalysis(userId);
+      if (!userId) {
+        incrementAnonUsed();
+        setAnonUsed(getAnonUsed());
+      }
+
+      // Save to Supabase if logged in
+      if (userId) {
+        try {
+          await saveDocument(userId, {
+            fileName,
+            docType: result.docType,
+            company: result.company,
+            country: result.country,
+            summary: result.summary,
+            riskLevel: result.riskLevel,
+            flags: result.flags,
+            highlights: result.highlights,
+            actions: result.actions,
+            labValues: result.labValues,
+            language,
+          });
+        } catch {
+          // Non-critical — don't fail the whole analysis if save fails
+        }
+      }
+
+      setState({ step: "result", result, fileName, sourceText, sourceFile });
     } catch (e) {
       const message = getErrorMessage(e);
       toast.error(message);
@@ -120,6 +180,16 @@ function Index() {
           : prev,
       );
     }
+  }
+
+  // Credit gate screen
+  if (state.step === "gate") {
+    return (
+      <div className="min-h-screen bg-background">
+        <Navbar />
+        <CreditGate isLoggedIn={!!user} />
+      </div>
+    );
   }
 
   if (state.step === "result") {
@@ -168,6 +238,10 @@ function Index() {
     );
   }
 
+  // Free analyses remaining for anonymous users
+  const anonRemaining = Math.max(0, 3 - anonUsed);
+  const showFreeCounter = !user && !authLoading && anonRemaining < 3;
+
   return (
     <div className="min-h-screen bg-background">
       <Navbar />
@@ -204,6 +278,18 @@ function Index() {
                   <AlertTitle>Couldn&apos;t explain this document</AlertTitle>
                   <AlertDescription>{state.error}</AlertDescription>
                 </Alert>
+              )}
+
+              {/* Free analyses counter — shown after first use */}
+              {showFreeCounter && (
+                <div
+                  className="mx-auto mt-4 inline-flex items-center gap-2 rounded-full px-4 py-2 text-[12px]"
+                  style={{ background: anonRemaining > 0 ? "var(--teal-soft)" : "#FEF2F2", color: anonRemaining > 0 ? "var(--teal-deep)" : "#991B1B" }}
+                >
+                  {anonRemaining > 0
+                    ? `${anonRemaining} free ${anonRemaining === 1 ? "analysis" : "analyses"} remaining`
+                    : "No free analyses left — top up to continue"}
+                </div>
               )}
 
               <div className="mt-6 flex flex-wrap items-center justify-center gap-x-4 gap-y-2 text-[12px] text-text-tertiary">
